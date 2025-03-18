@@ -28,12 +28,12 @@ python-dateutil==2.9.0.post0
 PyYAML==6.0.2
 regex==2024.11.6
 requests==2.32.3
-safetensors==0.4.5
+# safetensors==0.4.5
 setuptools==75.6.0
 six==1.16.0
 sympy==1.13.1
 tokenizers==0.20.3
-torch==2.5.1
+torch==2.6.0
 tqdm==4.67.1
 transformers==4.46.3
 typing_extensions==4.12.2
