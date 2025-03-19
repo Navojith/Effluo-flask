@@ -30,3 +30,6 @@ celerybeat-schedule-*
 
 #private files
 private
+
+#venv
+myenv
