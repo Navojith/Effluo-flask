@@ -14,9 +14,7 @@ COPY requirements.txt .
 # Install dependencies
 RUN pip install --upgrade pip 
 
-RUN pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
-
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
 COPY . .
