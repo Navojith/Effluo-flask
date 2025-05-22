@@ -1,26 +1,28 @@
-FROM python:latest
+# Use the official Python image as a base
+FROM python:3.13-alpine
 
-ENV PYTHONUNBUFFERED 1
-ENV PYTHONDONTWRITEBYTECODE 1
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-RUN pip install flask celery redis flask-sqlalchemy flask-wtf
+# Set the working directory
+WORKDIR /usr/src/app
 
-WORKDIR /appFROM python:latest
+# Copy the requirements file
+COPY requirements.txt .
 
-# Prevent Python from buffering stdout/stderr
-ENV PYTHONUNBUFFERED 1
+# Install dependencies
+RUN pip install --upgrade pip 
 
-# Prevent Python from writing .pyc files
-ENV PYTHONDONTWRITEBYTECODE 1
+RUN pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 
-# Set the working directory inside the container
-WORKDIR /app
+RUN pip install -r requirements.txt
 
-# Copy the requirements file into the container
-COPY requirements.txt /app/
+# Copy the rest of the application code
+COPY . .
 
-# Install dependencies from requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# Expose the port Flask runs on
+EXPOSE 5000
 
-# Copy the application code into the container
-COPY . /app/
+# Run the Flask app
+CMD ["python", "run.py"]
