@@ -1,8 +1,7 @@
 # from flask import Blueprint, jsonify, request
-from controllers.prioritizer_controller import pr_prioritizer_controller
+from app.controllers.prioritizer_controller import pr_prioritizer_controller
 from app.controllers import mcr_controller
 from flask import Blueprint, request, jsonify
-from .reviewer_assignment import analyze_reviewers
 
 main = Blueprint("main", __name__)
 
@@ -10,11 +9,6 @@ main = Blueprint("main", __name__)
 @main.route("/health", methods=["GET", "POST"])
 def health():
     return "OK"
-
-
-@main.route("/analyze-reviewers", methods=["GET", "POST"])
-def test():
-    return analyze_reviewers()
 
 
 @main.route("/prioritize-pr", methods=["POST"])
@@ -87,7 +81,7 @@ def mcr():
         branch_a_code = data.get("branch_a_code", "")
         branch_b_code = data.get("branch_b_code", "")
 
-        resolved_code = mcr_controller.mcr_controller(
+        resolved_code = mcr_controller.hierarchical_mcr_controller(
             base_code, branch_a_code, branch_b_code
         )
 

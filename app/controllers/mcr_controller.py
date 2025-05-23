@@ -1,25 +1,14 @@
-from app.merge_conflict_resolver.inference_pipeline.inference import MergeConflictResolver
+from app.merge_conflict_resolver.inference_pipeline.inference import (
+    HierarchicalMergeConflictResolver,
+)
 
 
-def mcr_controller(base_code, a_code, b_code):
-    """
-    Merge conflict resolution controller
+def hierarchical_mcr_controller(base_code, a_code, b_code):
+    resolver = HierarchicalMergeConflictResolver(
+        "./app/models/best_token_model.pt",
+        "./app/models/best_syntax_token_model.pt",
+    )
 
-    Args:
-        base_code (str): Base code
-        a_code (str): Code from branch A
-        b_code (str): Code from branch B
-
-    Returns:
-        str: Resolved code
-    """
-    # Initialize model
-    resolver = MergeConflictResolver('./app/merge_conflict_resolver/models/best_model.pt')
-
-    # Preprocess input
-    preprocessed_input = resolver.preprocess_merge_conflict(base_code, a_code, b_code)
-
-    # Generate resolution
-    resolved_code = resolver.generate_resolution(preprocessed_input)
+    resolved_code = resolver.resolve_conflict(base_code, a_code, b_code)
 
     return resolved_code
