@@ -4,10 +4,16 @@ import subprocess
 import tempfile
 import os
 import re
+import logging
 from collections import Counter
 from transformers import RobertaTokenizer, T5ForConditionalGeneration
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 import torch.nn.functional as F
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 class SyntaxExtractor:
@@ -55,7 +61,7 @@ class SyntaxExtractor:
                     syntacticElements["variables"][name] = True
 
         except Exception as e:
-            print(f"Error extracting syntax: {str(e)}")
+            logger.error(f"Error extracting syntax: {str(e)}")
             pass
 
         return syntacticElements
@@ -222,7 +228,7 @@ class SyntaxTokenModel(nn.Module):
         self.syntax_encoder = T5ForConditionalGeneration.from_pretrained(
             args["model_type"], from_tf=False
         )
-        self.syntax_encoder.resize_token_embeddings(args["vocab_size"])
+        self.syntax_encoder.resize_token_embeddings(len(tokenizer))
 
         self.syntax_enhancer = nn.Sequential(
             nn.Linear(self.embedding_dim, self.embedding_dim * 2),
@@ -303,6 +309,21 @@ class SyntaxTokenModel(nn.Module):
                 if m.bias is not None:
                     m.bias.data.fill_(-3.0)
 
+    def extract_syntax_features(self, syntax_embeddings, syntax_mask):
+        syntax_focused = self.syntax_enhancer(syntax_embeddings)
+
+        if torch.is_tensor(syntax_mask):
+            syntax_focused = syntax_focused * syntax_mask.unsqueeze(-1)
+
+        if torch.is_tensor(syntax_mask):
+            masked_sum = syntax_focused.sum(dim=1)
+            mask_sum = syntax_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            global_syntax = masked_sum / mask_sum
+        else:
+            global_syntax = syntax_focused.mean(dim=1)
+
+        return global_syntax.unsqueeze(1)
+
     def identify_syntax_tokens(self, input_ids):
         syntax_keywords = [
             "function",
@@ -339,7 +360,7 @@ class SyntaxTokenModel(nn.Module):
 
         return syntax_mask
 
-    def forward(self, input_txt, output_txt=None, syntax_context=None):
+    def forward(self, input_txt, output_txt=None, syntax_context=None, stage="test"):
         batch_size = input_txt.size(0)
         device = input_txt.device
 
@@ -352,14 +373,9 @@ class SyntaxTokenModel(nn.Module):
 
         with torch.no_grad():
             self.token_model = self.token_model.to(device)
-            encoder_output = self.token_model.t5.encoder(
+            token_embeddings = self.token_model.t5.encoder(
                 input_ids=input_txt, attention_mask=attention_mask, return_dict=True
-            )
-            if isinstance(encoder_output, tuple):
-                token_embeddings = encoder_output[0]
-            else:
-                token_embeddings = encoder_output.last_hidden_state
-
+            )["last_hidden_state"]
             original_token_embeddings = token_embeddings.clone()
 
         syntax_mask = syntax_context != self.tokenizer.pad_token_id
@@ -369,13 +385,9 @@ class SyntaxTokenModel(nn.Module):
 
         try:
             self.syntax_encoder = self.syntax_encoder.to(device)
-            syntax_output = self.syntax_encoder.encoder(
+            syntax_outputs = self.syntax_encoder.encoder(
                 input_ids=syntax_context, attention_mask=syntax_mask, return_dict=True
-            )
-            if isinstance(syntax_output, tuple):
-                syntax_outputs = syntax_output[0]
-            else:
-                syntax_outputs = syntax_output["last_hidden_state"]
+            )["last_hidden_state"]
 
             projected_syntax = self.syntax_enhancer(syntax_outputs)
 
@@ -441,7 +453,22 @@ class SyntaxTokenModel(nn.Module):
 
         final_embeddings = torch.nan_to_num(final_embeddings, nan=0.0)
 
-        if output_txt is not None:
+        if output_txt is None:
+            encoder_outputs = BaseModelOutputWithPastAndCrossAttentions(
+                last_hidden_state=final_embeddings, hidden_states=None, attentions=None
+            )
+
+            return self.token_model.t5.generate(
+                encoder_outputs=encoder_outputs,
+                attention_mask=attention_mask,
+                max_length=self.args.get("max_resolve_length", 300),
+                num_beams=4,
+                early_stopping=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                bos_token_id=self.tokenizer.bos_token_id,
+            )
+        else:
             decoder_outputs = self.token_model.t5.decoder(
                 input_ids=output_txt,
                 encoder_hidden_states=final_embeddings,
@@ -449,13 +476,34 @@ class SyntaxTokenModel(nn.Module):
                 return_dict=True,
             )
 
-            if isinstance(decoder_outputs, tuple):
-                last_hidden_state = decoder_outputs[0]
-            else:
-                last_hidden_state = decoder_outputs.last_hidden_state
-
-            logits = last_hidden_state * (self.embedding_dim**-0.5)
+            logits = decoder_outputs["last_hidden_state"] * (self.embedding_dim**-0.5)
             logits = self.token_model.t5.lm_head(logits)
+
+            if (
+                self.args.get("use_token_repetition_penalty", False)
+                and stage == "train"
+            ):
+                with torch.no_grad():
+                    pred_tokens = torch.argmax(logits, dim=-1).view(-1).tolist()
+                    for token in pred_tokens:
+                        self.token_usage_counter[token] += 1
+
+                token_counts = torch.zeros(logits.shape[-1], device=device)
+                for b in range(batch_size):
+                    pred_tokens = torch.argmax(logits[b], dim=-1)
+                    for t in pred_tokens:
+                        token_counts[t.item()] += 1
+
+                token_freq = token_counts / max((batch_size * logits.shape[1]), 1)
+
+                base_penalty = self.args.get("repetition_penalty", 1.5)
+                penalty = (
+                    1.0 + (token_freq * base_penalty) + (token_freq**2 * base_penalty)
+                )
+                penalty = torch.clamp(penalty, min=1.0, max=5.0)
+
+                penalty = penalty.view(1, 1, -1).expand_as(logits)
+                logits = logits / penalty
 
             outputs = F.log_softmax(logits, dim=-1)
 
@@ -482,21 +530,16 @@ class SyntaxTokenModel(nn.Module):
 
             tokens = mask.sum().clamp(min=1.0)
 
-            return loss.sum() / tokens, tokens
-        else:
-            encoder_outputs = BaseModelOutputWithPastAndCrossAttentions(
-                last_hidden_state=final_embeddings
-            )
-            return self.token_model.t5.generate(
-                encoder_outputs=encoder_outputs,
-                attention_mask=attention_mask,
-                max_length=self.args.get("max_resolve_length", 200),
-                num_beams=4,
-                early_stopping=True,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                bos_token_id=self.tokenizer.bos_token_id,
-            )
+            if stage == "train":
+                return loss.sum() / tokens, tokens
+            elif stage in ["dev", "test"]:
+                output_ids = torch.argmax(outputs, dim=-1)
+                return output_ids, loss.sum() / tokens, tokens, label
+
+    def get_syntax_usage(self):
+        if not self.syntax_influence_tracker:
+            return []
+        return self.syntax_influence_tracker
 
 
 class HierarchicalMergeConflictResolver:
@@ -521,7 +564,7 @@ class HierarchicalMergeConflictResolver:
             "model_type": model_type,
             "vocab_size": len(self.tokenizer),
             "max_conflict_length": 500,
-            "max_resolve_length": 200,
+            "max_resolve_length": 300,
             "max_context_length": 800,
             "cross_attention_layers": 3,
             "context_attention_heads": 8,
@@ -548,9 +591,9 @@ class HierarchicalMergeConflictResolver:
             state_dict, strict=False
         )
         if missing_keys:
-            print(f"Warning: Missing keys in state dict: {missing_keys}")
+            logger.warning(f"Missing keys in state dict: {missing_keys}")
         if unexpected_keys:
-            print(f"Warning: Unexpected keys in state dict: {unexpected_keys}")
+            logger.warning(f"Unexpected keys in state dict: {unexpected_keys}")
 
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -624,24 +667,19 @@ class HierarchicalMergeConflictResolver:
         return merged
 
     def extract_conflicts_from_tokens(self, merged_tokens):
-        """Extract conflicts directly from token sequence"""
         conflicts = []
 
         i = 0
         while i < len(merged_tokens):
-            # Find start of conflict
             if merged_tokens[i] == "<lbra>":
-                conflict_start_idx = max(0, i - 20)  # Get ~20 tokens of context before
+                conflict_start_idx = max(0, i - 20)
 
-                # Find end of conflict
                 j = i + 1
                 while j < len(merged_tokens) and merged_tokens[j] != "<rbra>":
                     j += 1
 
-                if j < len(merged_tokens):  # Found matching <rbra>
-                    conflict_end_idx = min(
-                        len(merged_tokens), j + 20
-                    )  # Get ~20 tokens of context after
+                if j < len(merged_tokens):
+                    conflict_end_idx = min(len(merged_tokens), j + 20)
 
                     conflict_tokens = merged_tokens[conflict_start_idx:conflict_end_idx]
                     conflicts.append(
@@ -686,7 +724,7 @@ class HierarchicalMergeConflictResolver:
         base_tokens = self.tokenizer.tokenize(base_code)
         total_tokens = len(base_tokens)
 
-        print(
+        logger.info(
             f"Large file detected: {total_tokens} tokens. Using conflict-focused approach."
         )
 
@@ -697,55 +735,47 @@ class HierarchicalMergeConflictResolver:
             base_tokens, branch_a_tokens, branch_b_tokens
         )
 
-        # Extract conflicts directly from token sequence
         conflicts = self.extract_conflicts_from_tokens(merged_tokens)
 
         if not conflicts:
-            print("No conflicts found in the file")
+            logger.info("No conflicts found in the file")
             return None
 
-        print(f"Found {len(conflicts)} conflict(s)")
+        logger.info(f"Found {len(conflicts)} conflict(s)")
 
-        # Merge all conflict tokens with separators
         all_conflict_tokens = []
         for idx, conflict in enumerate(conflicts):
             if idx > 0:
-                # Add separator tokens between conflicts
                 all_conflict_tokens.extend(
                     ["Ċ", "//", "Ġ=====", "ĠCONFLICT", "ĠSEPARATOR", "Ġ=====", "Ċ"]
                 )
             all_conflict_tokens.extend(conflict["tokens"])
 
-        # Check if conflicts fit within limit
         if len(all_conflict_tokens) > self.MAX_CONFLICT_LENGTH - 2:
-            print(
-                f"Warning: Conflicts exceed token limit ({len(all_conflict_tokens)} tokens), truncating"
+            logger.warning(
+                f"Conflicts exceed token limit ({len(all_conflict_tokens)} tokens), truncating"
             )
             all_conflict_tokens = all_conflict_tokens[: self.MAX_CONFLICT_LENGTH - 2]
 
-        # Convert to IDs
         conflict_ids = self.tokenizer.convert_tokens_to_ids(
             [self.tokenizer.bos_token]
             + all_conflict_tokens
             + [self.tokenizer.eos_token]
         )
 
-        # Pad to fixed length
         conflict_ids = self.pad_length(
             conflict_ids, self.MAX_CONFLICT_LENGTH, self.tokenizer.pad_token_id
         )
 
-        # Extract syntax from all three versions
         base_syntax = self.syntax_extractor.extract(base_code)
         a_syntax = self.syntax_extractor.extract(branch_a_code)
         b_syntax = self.syntax_extractor.extract(branch_b_code)
         combined_syntax = self.merge_syntax_elements(base_syntax, a_syntax, b_syntax)
         syntax_context = self.syntax_extractor.format_for_model(combined_syntax)
 
-        # Tokenize syntax
         syntax_tokens = self.tokenizer.tokenize(syntax_context)
         if len(syntax_tokens) > self.MAX_CONTEXT_LENGTH - 2:
-            print(
+            logger.warning(
                 f"Syntax tokens truncated from {len(syntax_tokens)} to {self.MAX_CONTEXT_LENGTH - 2}"
             )
             syntax_tokens = syntax_tokens[: self.MAX_CONTEXT_LENGTH - 2]
@@ -757,26 +787,26 @@ class HierarchicalMergeConflictResolver:
             syntax_ids, self.MAX_CONTEXT_LENGTH, self.tokenizer.pad_token_id
         )
 
-        # Create tensors
         input_tensor = torch.tensor(conflict_ids).unsqueeze(0).to(self.device)
         syntax_tensor = torch.tensor(syntax_ids).unsqueeze(0).to(self.device)
         attention_mask = (input_tensor != self.tokenizer.pad_token_id).float()
 
-        # Debug: Print what the model will see
-        print(f"Conflict tokens being sent to model: {len(all_conflict_tokens)} tokens")
+        logger.debug(
+            f"Conflict tokens being sent to model: {len(all_conflict_tokens)} tokens"
+        )
         sample_text = self.tokenizer.decode(
             conflict_ids[:100], skip_special_tokens=False
         )
-        print(f"Sample of conflict input: {sample_text}...")
+        logger.debug(f"Sample of conflict input: {sample_text}...")
 
         return {
             "input_ids": input_tensor,
             "attention_mask": attention_mask,
             "syntax_context": syntax_tensor,
             "is_partial": True,
-            "conflict_info": conflicts,  # Store token-based conflict info
+            "conflict_info": conflicts,
             "total_file_tokens": total_tokens,
-            "original_base": base_code,  # Keep original for reconstruction
+            "original_base": base_code,
         }
 
     def preprocess_normal(self, base_code, branch_a_code, branch_b_code):
@@ -906,9 +936,9 @@ class HierarchicalMergeConflictResolver:
                     + [self.tokenizer.eos_token]
                 )
 
-                print(
+                logger.debug(
                     f"Decoded tokens: {len(decoded_tokens)} tokens, "
-                    f"Final tokens: {final_tokens} tokens"
+                    f"Final tokens: {len(final_tokens)} tokens"
                 )
 
                 return final_tokens
@@ -935,62 +965,49 @@ class HierarchicalMergeConflictResolver:
                 return resolved_code.strip()
 
             except Exception as e:
-                print(f"Generation error: {str(e)}")
-                print(f"Input shape: {input_ids.shape}")
-                print(f"Syntax context shape: {syntax_context.shape}")
+                logger.error(f"Generation error: {str(e)}")
+                logger.debug(f"Input shape: {input_ids.shape}")
+                logger.debug(f"Syntax context shape: {syntax_context.shape}")
                 raise
 
     def reconstruct_file_from_tokens(self, original_base, conflicts, resolution):
-        """Reconstruct file by replacing conflict regions with resolution"""
         if len(conflicts) == 1:
-            # Try to find the method signature in both resolution and original
-            import re
-
-            # Look for the handleDataProcessing method
             pattern = r"(handleDataProcessing.*?\{[\s\S]*?\n\s*\})"
 
             resolved_match = re.search(pattern, resolution)
             if resolved_match:
                 resolved_method = resolved_match.group(1)
 
-                # Replace in original
                 original_match = re.search(pattern, original_base)
                 if original_match:
                     return original_base.replace(
                         original_match.group(1), resolved_method
                     )
 
-        # Fallback: return the resolution as-is
         return resolution
 
     def resolve_conflict(
         self, base_code, branch_a_code, branch_b_code, return_syntax_info=False
     ):
         try:
-            # Check if we should use conflict-focused approach
             base_tokens = self.tokenizer.tokenize(base_code)
             a_tokens = self.tokenizer.tokenize(branch_a_code)
             b_tokens = self.tokenizer.tokenize(branch_b_code)
 
-            # Get merged tokens to check total size
             merged_tokens = self.git_merge_tokens(base_tokens, a_tokens, b_tokens)
 
             if len(merged_tokens) > self.MAX_CONFLICT_LENGTH:
-                # Use conflict-focused approach
                 preprocessed = self.preprocess_conflict_focused(
                     base_code, branch_a_code, branch_b_code
                 )
 
                 if preprocessed is None:
-                    print("No conflicts found, returning base code")
+                    logger.info("No conflicts found, returning base code")
                     return base_code
 
-                # Generate resolution
                 resolution = self.generate_resolution(preprocessed)
 
-                # Reconstruct the full file
                 if preprocessed.get("is_partial", False):
-                    # For token-based conflicts, use special reconstruction
                     final_resolution = self.reconstruct_file_from_tokens(
                         preprocessed["original_base"],
                         preprocessed["conflict_info"],
@@ -999,7 +1016,6 @@ class HierarchicalMergeConflictResolver:
                 else:
                     final_resolution = resolution
             else:
-                # Use normal processing for small files
                 preprocessed = self.preprocess_normal(
                     base_code, branch_a_code, branch_b_code
                 )
@@ -1014,7 +1030,7 @@ class HierarchicalMergeConflictResolver:
             return final_resolution
 
         except Exception as e:
-            print(f"Error in conflict resolution: {str(e)}")
+            logger.error(f"Error in conflict resolution: {str(e)}")
             import traceback
 
             traceback.print_exc()
