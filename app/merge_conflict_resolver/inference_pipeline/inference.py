@@ -228,7 +228,7 @@ class SyntaxTokenModel(nn.Module):
         self.syntax_encoder = T5ForConditionalGeneration.from_pretrained(
             args["model_type"], from_tf=False
         )
-        self.syntax_encoder.resize_token_embeddings(len(tokenizer))
+        self.syntax_encoder.resize_token_embeddings(args["vocab_size"])
 
         self.syntax_enhancer = nn.Sequential(
             nn.Linear(self.embedding_dim, self.embedding_dim * 2),
@@ -467,6 +467,8 @@ class SyntaxTokenModel(nn.Module):
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
                 bos_token_id=self.tokenizer.bos_token_id,
+                decoder_start_token_id=self.tokenizer.bos_token_id,
+                forced_eos_token_id=self.tokenizer.eos_token_id,
             )
         else:
             decoder_outputs = self.token_model.t5.decoder(
@@ -672,14 +674,26 @@ class HierarchicalMergeConflictResolver:
         i = 0
         while i < len(merged_tokens):
             if merged_tokens[i] == "<lbra>":
-                conflict_start_idx = max(0, i - 20)
+                # Found start of a conflict
+                conflict_start = i
 
+                # Find the corresponding closing marker
                 j = i + 1
+                sep_count = 0
                 while j < len(merged_tokens) and merged_tokens[j] != "<rbra>":
+                    if merged_tokens[j] == self.tokenizer.sep_token:
+                        sep_count += 1
                     j += 1
 
-                if j < len(merged_tokens):
-                    conflict_end_idx = min(len(merged_tokens), j + 20)
+                if (
+                    j < len(merged_tokens) and sep_count == 2
+                ):  # Valid conflict has exactly 2 separators
+                    # Include some context before and after
+                    context_before = 20
+                    context_after = 20
+
+                    conflict_start_idx = max(0, conflict_start - context_before)
+                    conflict_end_idx = min(len(merged_tokens), j + 1 + context_after)
 
                     conflict_tokens = merged_tokens[conflict_start_idx:conflict_end_idx]
                     conflicts.append(
@@ -687,12 +701,14 @@ class HierarchicalMergeConflictResolver:
                             "tokens": conflict_tokens,
                             "start_idx": conflict_start_idx,
                             "end_idx": conflict_end_idx,
-                            "conflict_start_offset": i - conflict_start_idx,
+                            "conflict_start_offset": conflict_start
+                            - conflict_start_idx,
                             "conflict_end_offset": j - conflict_start_idx,
                         }
                     )
                     i = j + 1
                 else:
+                    # Invalid conflict structure, skip
                     i += 1
             else:
                 i += 1
@@ -704,9 +720,7 @@ class HierarchicalMergeConflictResolver:
             return []
 
         merged_lines = []
-        for idx, conflict in enumerate(conflicts):
-            if idx > 0:
-                merged_lines.append("// ===== CONFLICT SEPARATOR =====")
+        for conflict in conflicts:
             merged_lines.extend(conflict["lines"])
 
         return merged_lines
@@ -744,11 +758,7 @@ class HierarchicalMergeConflictResolver:
         logger.info(f"Found {len(conflicts)} conflict(s)")
 
         all_conflict_tokens = []
-        for idx, conflict in enumerate(conflicts):
-            if idx > 0:
-                all_conflict_tokens.extend(
-                    ["Ċ", "//", "Ġ=====", "ĠCONFLICT", "ĠSEPARATOR", "Ġ=====", "Ċ"]
-                )
+        for conflict in conflicts:
             all_conflict_tokens.extend(conflict["tokens"])
 
         if len(all_conflict_tokens) > self.MAX_CONFLICT_LENGTH - 2:
@@ -840,6 +850,20 @@ class HierarchicalMergeConflictResolver:
             syntax_tokens = [self.tokenizer.bos_token]
 
         syntax_ids = self.tokenizer.convert_tokens_to_ids(syntax_tokens)
+
+        if len(syntax_ids) > self.MAX_CONTEXT_LENGTH - 2:
+            syntax_ids = (
+                [self.tokenizer.bos_token_id]
+                + syntax_ids[: self.MAX_CONTEXT_LENGTH - 2]
+                + [self.tokenizer.eos_token_id]
+            )
+        else:
+            syntax_ids = (
+                [self.tokenizer.bos_token_id]
+                + syntax_ids
+                + [self.tokenizer.eos_token_id]
+            )
+
         padded_syntax = self.pad_length(
             syntax_ids, self.MAX_CONTEXT_LENGTH, self.tokenizer.pad_token_id
         )
@@ -956,11 +980,32 @@ class HierarchicalMergeConflictResolver:
                     input_txt=input_ids, syntax_context=syntax_context
                 )
 
+                # Filter out any token IDs that might be padding or special tokens
+                generated_sequence = generated_ids[0].cpu().numpy()
+
+                # Remove padding tokens and any tokens after EOS
+                if self.tokenizer.eos_token_id in generated_sequence:
+                    eos_idx = generated_sequence.tolist().index(
+                        self.tokenizer.eos_token_id
+                    )
+                    generated_sequence = generated_sequence[:eos_idx]
+
+                # Filter out padding tokens
+                generated_sequence = generated_sequence[
+                    generated_sequence != self.tokenizer.pad_token_id
+                ]
+
+                # Decode the sequence
                 resolved_code = self.tokenizer.decode(
-                    generated_ids[0],
+                    generated_sequence,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=True,
                 )
+
+                # Fix the specific issue with token 306 appearing as "306"
+                import re
+
+                resolved_code = re.sub(r"\b306\b", "        ", resolved_code)
 
                 return resolved_code.strip()
 

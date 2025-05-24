@@ -1,7 +1,12 @@
-# from flask import Blueprint, jsonify, request
+import logging
 from app.controllers.prioritizer_controller import pr_prioritizer_controller
 from app.controllers import mcr_controller
 from flask import Blueprint, request, jsonify
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 main = Blueprint("main", __name__)
 
@@ -49,7 +54,7 @@ def predict_pr_priorities():
             )
 
         prs_data = data["pull_requests"]
-        print(prs_data)
+        logger.debug(prs_data)
 
         if not prs_data or not isinstance(prs_data, list):
             return (
@@ -80,6 +85,22 @@ def mcr():
         base_code = data.get("base_code", "")
         branch_a_code = data.get("branch_a_code", "")
         branch_b_code = data.get("branch_b_code", "")
+
+        logger.debug(
+            {
+                "base_code": base_code,
+                "branch_a_code": branch_a_code,
+                "branch_b_code": branch_b_code,
+            }
+        )
+
+        if not base_code or not branch_a_code or not branch_b_code:
+            return (
+                jsonify(
+                    {"status": "error", "message": "Missing required code snippets"}
+                ),
+                400,
+            )
 
         resolved_code = mcr_controller.hierarchical_mcr_controller(
             base_code, branch_a_code, branch_b_code
