@@ -108,7 +108,8 @@ def generate_embeddings_with_dataloader(texts, tokenizer, model, device, batch_s
 
 
 class PRPrioritizer:
-    def __init__(self, model_path="./app/models/pr_priority_model.pkl"):
+    # def __init__(self, model_path='./app/models/pr_priority_model.pkl'):
+    def __init__(self, model_path='./app/models/pr_priority_model_new.pkl'):
         """Initialize the PR Prioritizer with a trained model"""
         logger.info(f"Loading model from {model_path}")
         with open(model_path, "rb") as f:
